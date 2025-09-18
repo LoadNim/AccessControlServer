@@ -4,7 +4,7 @@
 
 ## 공개 서버 주소 (Public Server URL)
 
-  * **`https://access-control-server.onrender.com`**
+  * **`https://accesscontrolserver.onrender.com`**
 
 -----
 
