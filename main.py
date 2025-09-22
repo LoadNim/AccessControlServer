@@ -1,22 +1,24 @@
-# main.py — 최종본 v1.4: 데이터 조회 API 분리
+# main.py — 최종본 v1.5: 등록 상태 변경 및 삭제 API 추가
 # 채널: /qr-events (JSON only), /access-events (metadata + 1 image),
 #       /registrations (metadata + N images)
 
 import os
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+
+from typing import Any, Dict, List, Optional
+from pathlib import Path
 import datetime as dt
 import hashlib
 import json
 import uuid
-import boto3
-
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
-from typing import Any, Dict, List, Optional
-from pathlib import Path
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
+
+import boto3
 
 # =========================
 # FastAPI 기본 설정
@@ -57,7 +59,7 @@ s3_client = boto3.client(
 )
 
 # =========================
-# DB 함수 (조회 함수 분리됨)
+# DB 함수 (수정/삭제 함수 추가됨)
 # =========================
 
 # --- 데이터 삽입(INSERT) 함수들 ---
@@ -69,30 +71,20 @@ def insert_access_event(images_dir: str, requested_at: str, device_id: str):
             VALUES (:images_dir, :requested_at, :device_id)
             """
         )
-        conn.execute(
-            statement,
-            {"images_dir": images_dir, "requested_at": requested_at, "device_id": device_id}
-        )
+        conn.execute(statement, {"images_dir": images_dir, "requested_at": requested_at, "device_id": device_id})
         conn.commit()
 
 def insert_registration(images_dir: str, dong: str, ho: str, phone: str, requested_at: str, device_id: str):
     with engine.connect() as conn:
         statement = text(
             """
-            INSERT INTO registrations (images_dir, dong, ho, phone, requested_at, device_id) 
-            VALUES (:images_dir, :dong, :ho, :phone, :requested_at, :device_id)
+            INSERT INTO registrations (images_dir, dong, ho, phone, requested_at, device_id, status) 
+            VALUES (:images_dir, :dong, :ho, :phone, :requested_at, :device_id, DEFAULT)
             """
         )
         conn.execute(
             statement,
-            {
-                "images_dir": images_dir,
-                "dong": dong,
-                "ho": ho,
-                "phone": phone,
-                "requested_at": requested_at,
-                "device_id": device_id
-            }
+            {"images_dir": images_dir, "dong": dong, "ho": ho, "phone": phone, "requested_at": requested_at, "device_id": device_id}
         )
         conn.commit()
 
@@ -104,30 +96,41 @@ def insert_qr_event(phone: str, purpose: str, requested_at: str, device_id: str)
             VALUES (:phone, :purpose, :requested_at, :device_id, DEFAULT)
             """
         )
-        conn.execute(
-            statement,
-            {"phone": phone, "purpose": purpose, "requested_at": requested_at, "device_id": device_id}
-        )
+        conn.execute(statement, {"phone": phone, "purpose": purpose, "requested_at": requested_at, "device_id": device_id})
         conn.commit()
 
 # --- 데이터 조회(SELECT) 함수들 ---
 def get_all_registrations(limit: int = 50):
-    """registrations 테이블에서 최신 데이터를 조회합니다."""
     with engine.connect() as conn:
         result = conn.execute(text("SELECT * FROM registrations ORDER BY id DESC LIMIT :limit"), {"limit": limit})
         return [dict(row._mapping) for row in result]
 
 def get_all_access_events(limit: int = 50):
-    """access_events 테이블에서 최신 데이터를 조회합니다."""
     with engine.connect() as conn:
         result = conn.execute(text("SELECT * FROM access_events ORDER BY id DESC LIMIT :limit"), {"limit": limit})
         return [dict(row._mapping) for row in result]
 
 def get_all_qr_events(limit: int = 50):
-    """qr_events 테이블에서 최신 데이터를 조회합니다."""
     with engine.connect() as conn:
         result = conn.execute(text("SELECT * FROM qr_events ORDER BY id DESC LIMIT :limit"), {"limit": limit})
         return [dict(row._mapping) for row in result]
+
+# --- 데이터 수정(UPDATE) 및 삭제(DELETE) 함수들 ---
+def update_registration_status(registration_id: int, new_status: str):
+    """특정 등록 이벤트의 상태를 변경합니다."""
+    with engine.connect() as conn:
+        statement = text("UPDATE registrations SET status = :status WHERE id = :id")
+        result = conn.execute(statement, {"status": new_status, "id": registration_id})
+        conn.commit()
+        return result.rowcount > 0
+
+def delete_registration(registration_id: int):
+    """특정 등록 이벤트를 삭제합니다."""
+    with engine.connect() as conn:
+        statement = text("DELETE FROM registrations WHERE id = :id")
+        result = conn.execute(statement, {"id": registration_id})
+        conn.commit()
+        return result.rowcount > 0
 
 # =========================
 # 공용 유틸 (변경 없음)
@@ -153,7 +156,6 @@ def _augment_timing(meta: Dict[str, Any]) -> Dict[str, Any]:
     server_recv = dt.datetime.now(KST)
     timing = dict(meta.get("timing") or {})
     capture_time = timing.get("capture_time")
-
     client_dt = _parse_iso_any(capture_time)
     transfer_ms: Optional[int] = None
     if client_dt:
@@ -161,7 +163,6 @@ def _augment_timing(meta: Dict[str, Any]) -> Dict[str, Any]:
             transfer_ms = int((server_recv - client_dt.astimezone(KST)).total_seconds() * 1000)
         except Exception:
             transfer_ms = None
-
     timing["server_received_at"] = _iso_kst(server_recv)
     if transfer_ms is not None:
         timing["transfer_ms"] = transfer_ms
@@ -204,25 +205,46 @@ def favicon():
     return Response(status_code=204)
 
 # =========================
-# API 엔드포인트 (조회 엔드포인트 분리됨)
+# API 엔드포인트
 # =========================
 
 # --- 데이터 조회용 GET 엔드포인트들 ---
 @app.get("/registrations", summary="모든 등록 이벤트 목록 조회")
 def list_registrations():
-    """DB에서 모든 '등록' 이벤트를 조회하여 JSON으로 반환합니다."""
     return {"registrations": get_all_registrations()}
 
 @app.get("/access-events", summary="모든 출입 이벤트 목록 조회")
 def list_access_events():
-    """DB에서 모든 '출입' 이벤트를 조회하여 JSON으로 반환합니다."""
     return {"access_events": get_all_access_events()}
 
 @app.get("/qr-events", summary="모든 QR 이벤트 목록 조회")
 def list_qr_events():
-    """DB에서 모든 'QR' 이벤트를 조회하여 JSON으로 반환합니다."""
     return {"qr_events": get_all_qr_events()}
 
+# --- 데이터 수정 및 삭제용 엔드포인트들 ---
+@app.patch("/registrations/{registration_id}/approve", status_code=status.HTTP_200_OK, summary="등록 요청 승인")
+def approve_registration(registration_id: int):
+    """특정 등록 요청의 상태를 '승인'으로 변경합니다."""
+    success = update_registration_status(registration_id, "승인")
+    if not success:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    return {"message": "Registration approved successfully"}
+
+@app.patch("/registrations/{registration_id}/reject", status_code=status.HTTP_200_OK, summary="등록 요청 거절 및 삭제")
+def reject_registration(registration_id: int):
+    """특정 등록 요청을 거절하고 DB에서 삭제합니다."""
+    success = delete_registration(registration_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    return {"message": "Registration rejected and deleted successfully"}
+
+@app.delete("/registrations/{registration_id}", status_code=status.HTTP_200_OK, summary="등록된 사용자 삭제")
+def remove_registration(registration_id: int):
+    """특정 등록 데이터를 DB에서 삭제합니다."""
+    success = delete_registration(registration_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    return {"message": "Registration deleted successfully"}
 
 # --- 데이터 기록용 POST 엔드포인트들 ---
 @app.post("/qr-events")
